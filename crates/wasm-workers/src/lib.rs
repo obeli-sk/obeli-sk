@@ -4,11 +4,7 @@ use tracing::{debug, info, trace};
 use utils::wasm_tools;
 use wit_parser::{Resolve, WorldId};
 
-pub mod activity_worker;
-pub mod auto_worker;
-pub mod epoch_ticker;
 mod workflow_ctx;
-pub mod workflow_worker;
 
 pub struct EngineConfig {
     pub allocation_strategy: wasmtime::InstanceAllocationStrategy,

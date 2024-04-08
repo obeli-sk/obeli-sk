@@ -1,4 +1,3 @@
-use crate::workflow_worker::JoinNextBlockingStrategy;
 use chrono::{DateTime, Utc};
 use concepts::prefixed_ulid::{DelayId, JoinSetId};
 use concepts::storage::{
@@ -15,10 +14,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, trace};
 use utils::time::ClockFn;
-use wasmtime::component::{Linker, Val};
+use wasmtime::component::Val;
 
 const DB_LATENCY_MILLIS: u32 = 10; // do not interrupt if requested to sleep for less time.
-const DB_POLL_SLEEP: Duration = Duration::from_millis(50);
 
 #[derive(thiserror::Error, Debug, Clone)]
 pub(crate) enum FunctionError {
@@ -46,20 +44,12 @@ impl From<FunctionError> for WorkerError {
     }
 }
 
-// Generate `host_activities::Host` trait
-wasmtime::component::bindgen!({
-    path: "../../wit/workflow-engine/",
-    async: true,
-    interfaces: "import my-org:workflow-engine/host-activities;",
-});
-
 pub(crate) struct WorkflowCtx<C: ClockFn, DB: DbConnection> {
     execution_id: ExecutionId,
     events: Vec<HistoryEvent>,
     events_idx: usize,
     rng: StdRng,
     pub(crate) clock_fn: C,
-    join_next_blocking_strategy: JoinNextBlockingStrategy,
     db_connection: DB,
     version: Version,
     execution_deadline: DateTime<Utc>,
@@ -74,7 +64,6 @@ impl<C: ClockFn, DB: DbConnection> WorkflowCtx<C, DB> {
         events: Vec<HistoryEvent>,
         seed: u64,
         clock_fn: C,
-        join_next_blocking_strategy: JoinNextBlockingStrategy,
         db_connection: DB,
         version: Version,
         execution_deadline: DateTime<Utc>,
@@ -87,7 +76,7 @@ impl<C: ClockFn, DB: DbConnection> WorkflowCtx<C, DB> {
             events_idx: 0,
             rng: StdRng::seed_from_u64(seed),
             clock_fn,
-            join_next_blocking_strategy,
+            // join_next_blocking_strategy,
             db_connection,
             version,
             execution_deadline,
@@ -100,7 +89,6 @@ impl<C: ClockFn, DB: DbConnection> WorkflowCtx<C, DB> {
     async fn replay_or_interrupt(
         &mut self,
         ffqn: FunctionFqn,
-        params: Params,
     ) -> Result<SupportedFunctionResult, FunctionError> {
         let new_join_set_id =
             JoinSetId::from_parts(self.execution_id.timestamp_part(), self.next_u128());
@@ -165,7 +153,7 @@ impl<C: ClockFn, DB: DbConnection> WorkflowCtx<C, DB> {
         }
         // not found in the history, persisting the request
         let created_at = (self.clock_fn)();
-        let interrupt = self.join_next_blocking_strategy == JoinNextBlockingStrategy::Interrupt;
+        let interrupt = true;
 
         let join_set = AppendRequest {
             created_at,
@@ -211,194 +199,20 @@ impl<C: ClockFn, DB: DbConnection> WorkflowCtx<C, DB> {
             )
             .await?;
 
-        self.version = self
-            .db_connection
+        self.db_connection
             .create(
                 created_at,
                 new_child_execution_id,
                 ffqn,
-                params,
+                Params::Empty,
                 Some((self.execution_id, new_join_set_id)),
                 None,
                 self.child_retry_exp_backoff,
                 self.child_max_retries,
             )
             .await?;
-        if interrupt {
-            Err(FunctionError::ChildExecutionRequest)
-        } else {
-            debug!(child_execution_id = %new_child_execution_id, join_set_id = %new_join_set_id,  "Waiting for child execution result");
-            loop {
-                // fetch
-                let eh = self.db_connection.get(self.execution_id).await?; // TODO: fetch since the current version
 
-                if let Some(res) = eh.event_history().find_map(|e| match e {
-                    HistoryEvent::JoinSetResponse {
-                        response:
-                            JoinSetResponse::ChildExecutionFinished {
-                                child_execution_id,
-                                result,
-                            },
-                        join_set_id,
-                    } if child_execution_id == new_child_execution_id
-                        && join_set_id == new_join_set_id =>
-                    {
-                        Some(result.expect("FIXME")) // TODO: Map FinishedExecutionError somehow
-                    }
-                    _ => None,
-                }) {
-                    debug!(join_set_id = %new_join_set_id, child_execution_id = %new_child_execution_id, "Got child execution result");
-                    return Ok(res);
-                }
-                tokio::time::sleep(DB_POLL_SLEEP).await;
-            }
-        }
-    }
-
-    #[allow(dead_code)] // False positive
-    pub(crate) async fn call_imported_func(
-        &mut self,
-        ffqn: FunctionFqn,
-        params: &[Val],
-        results: &mut [Val],
-    ) -> Result<(), FunctionError> {
-        let res = self
-            .replay_or_interrupt(ffqn, Params::Vals(Arc::new(Vec::from(params))))
-            .await?;
-        assert_eq!(results.len(), res.len(), "unexpected results length");
-        for (idx, item) in res.value().into_iter().enumerate() {
-            results[idx] = val_json::wast_val::val(item, &results[idx].ty()).unwrap();
-        }
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_lines)]
-    async fn sleep(&mut self, millis: u32) -> Result<(), FunctionError> {
-        let new_join_set_id =
-            JoinSetId::from_parts(self.execution_id.timestamp_part(), self.next_u128());
-        let new_delay_id =
-            DelayId::from_parts(self.execution_id.timestamp_part(), self.next_u128());
-        trace!(
-            "Querying history for {new_delay_id}, index: {}, history: {:?}",
-            self.events_idx,
-            self.events
-        );
-        let created_at = (self.clock_fn)();
-        let new_expires_at = created_at + Duration::from_millis(u64::from(millis));
-        while let Some(found) = self.events.get(self.events_idx) {
-            match found {
-                HistoryEvent::JoinSet { join_set_id: found } if *found == new_join_set_id => {
-                    trace!(join_set_id = %new_join_set_id, delay_id = %new_delay_id, "Matched JoinSet");
-                    self.events_idx += 1;
-                }
-                HistoryEvent::JoinSetRequest {
-                    join_set_id,
-                    request:
-                        JoinSetRequest::DelayRequest {
-                            delay_id,
-                            expires_at: _do_not_compare, // already computed in the past, will not match
-                        },
-                } if *join_set_id == new_join_set_id && *delay_id == new_delay_id => {
-                    trace!(join_set_id = %new_join_set_id, delay_id = %new_delay_id, "Matched DelayRequest");
-                    self.events_idx += 1;
-                }
-                HistoryEvent::JoinNext {
-                    join_set_id,
-                    lock_expires_at: _,
-                } if *join_set_id == new_join_set_id => {
-                    trace!(join_set_id = %new_join_set_id, delay_id = %new_delay_id, "Matched JoinNextBlocking");
-                    self.events_idx += 1;
-                }
-                HistoryEvent::JoinSetResponse {
-                    response: JoinSetResponse::DelayFinished { delay_id },
-                    ..
-                } if new_delay_id == *delay_id => {
-                    debug!(join_set_id = %new_join_set_id, delay_id = %new_delay_id,  "Found response in history");
-                    self.events_idx += 1;
-                    return Ok(());
-                }
-                unexpected => {
-                    return Err(FunctionError::NonDeterminismDetected(StrVariant::Arc(
-                        Arc::from(format!(
-                            "sleep: unexpected event {unexpected:?} at index {}",
-                            self.events_idx
-                        )),
-                    )));
-                }
-            }
-        }
-        // not found in the history, persisting the request
-        let join_set = AppendRequest {
-            created_at,
-            event: ExecutionEventInner::HistoryEvent {
-                event: HistoryEvent::JoinSet {
-                    join_set_id: new_join_set_id,
-                },
-            },
-        };
-        let delayed_until = AppendRequest {
-            created_at,
-            event: ExecutionEventInner::HistoryEvent {
-                event: HistoryEvent::JoinSetRequest {
-                    join_set_id: new_join_set_id,
-                    request: JoinSetRequest::DelayRequest {
-                        delay_id: new_delay_id,
-                        expires_at: new_expires_at,
-                    },
-                },
-            },
-        };
-
-        let interrupt = self.join_next_blocking_strategy == JoinNextBlockingStrategy::Interrupt
-            && millis > DB_LATENCY_MILLIS
-            || new_expires_at < self.execution_deadline; // do not interrupt on a short delay
-        let join_next = AppendRequest {
-            created_at,
-            event: ExecutionEventInner::HistoryEvent {
-                event: HistoryEvent::JoinNext {
-                    join_set_id: new_join_set_id,
-                    lock_expires_at: if interrupt {
-                        created_at
-                    } else {
-                        self.execution_deadline
-                    },
-                },
-            },
-        };
-
-        self.version = self
-            .db_connection
-            .append_batch(
-                vec![join_set, delayed_until, join_next],
-                self.execution_id,
-                Some(self.version),
-            )
-            .await?;
-
-        if interrupt {
-            Err(FunctionError::DelayRequest)
-        } else {
-            let delay = (new_expires_at - (self.clock_fn)())
-                .to_std()
-                .unwrap_or_default();
-            debug!(join_set_id = %new_join_set_id, delay_id = %new_delay_id,  "Waiting for async timer for {delay:?}");
-            tokio::time::sleep(delay).await;
-            loop {
-                // fetch
-                let eh = self.db_connection.get(self.execution_id).await?; // TODO: fetch since the current version
-                let expected = HistoryEvent::JoinSetResponse {
-                    response: JoinSetResponse::DelayFinished {
-                        delay_id: new_delay_id,
-                    },
-                    join_set_id: new_join_set_id,
-                };
-                if eh.event_history().any(|e| e == expected) {
-                    debug!(join_set_id = %new_join_set_id, delay_id = %new_delay_id,  "Finished waiting for async timer");
-                    return Ok(());
-                }
-                tokio::time::sleep(DB_POLL_SLEEP).await;
-            }
-        }
+        Err(FunctionError::ChildExecutionRequest)
     }
 
     pub(crate) fn next_u128(&mut self) -> u128 {
@@ -406,25 +220,11 @@ impl<C: ClockFn, DB: DbConnection> WorkflowCtx<C, DB> {
         self.rng.fill_bytes(&mut bytes);
         u128::from_be_bytes(bytes)
     }
-
-    #[allow(dead_code)] // False positive
-    pub(crate) fn add_to_linker(linker: &mut Linker<Self>) -> Result<(), wasmtime::Error> {
-        my_org::workflow_engine::host_activities::add_to_linker(linker, |state: &mut Self| state)
-    }
-}
-
-#[async_trait::async_trait]
-impl<C: ClockFn, DB: DbConnection> my_org::workflow_engine::host_activities::Host
-    for WorkflowCtx<C, DB>
-{
-    async fn sleep(&mut self, millis: u32) -> wasmtime::Result<()> {
-        Ok(self.sleep(millis).await?)
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::{workflow_ctx::WorkflowCtx, workflow_worker::JoinNextBlockingStrategy};
+    use crate::workflow_ctx::WorkflowCtx;
     use async_trait::async_trait;
     use chrono::{DateTime, Utc};
     use concepts::{
@@ -450,7 +250,6 @@ mod tests {
     #[derive(Debug, Clone, arbitrary::Arbitrary)]
     #[allow(dead_code)]
     enum WorkflowStep {
-        Sleep { millis: u32 },
         Call { ffqn: FunctionFqn },
     }
 
@@ -486,7 +285,6 @@ mod tests {
                 events,
                 seed,
                 self.clock_fn.clone(),
-                JoinNextBlockingStrategy::default(),
                 self.db_connection.clone(),
                 version,
                 execution_deadline,
@@ -495,14 +293,11 @@ mod tests {
             );
             for step in &self.steps {
                 match step {
-                    WorkflowStep::Sleep { millis } => ctx.sleep(*millis).await,
-                    WorkflowStep::Call { ffqn } => {
-                        ctx.call_imported_func(ffqn.clone(), &[], &mut []).await
-                    }
+                    WorkflowStep::Call { ffqn } => ctx.replay_or_interrupt(ffqn.clone()).await,
                 }
-                .map_err(|err| (WorkerError::from(err), version))?;
+                .map_err(|err| (WorkerError::from(err), ctx.version))?;
             }
-            Ok((SupportedFunctionResult::None, version))
+            Ok((SupportedFunctionResult::None, ctx.version))
         }
 
         fn supported_functions(&self) -> impl Iterator<Item = &FunctionFqn> {
@@ -533,7 +328,7 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         let created_at = now();
-        debug!(now = %created_at, "Generated steps: {steps:?}");
+        info!(now = %created_at, "Generated steps: {steps:?}");
         let execution_id = ExecutionId::generate();
         info!("first execution");
         let first = execute_steps(execution_id, steps.clone(), SimClock::new(created_at)).await;
@@ -554,10 +349,7 @@ mod tests {
             .iter()
             .filter(|step| matches!(step, WorkflowStep::Call { .. }))
             .count();
-        let mut delay_request_count = steps
-            .iter()
-            .filter(|step| matches!(step, WorkflowStep::Sleep { .. }))
-            .count();
+
         let timers_watcher_task = expired_timers_watcher::Task::spawn_new(
             db_connection.clone(),
             expired_timers_watcher::Config {
@@ -622,21 +414,12 @@ mod tests {
             }
             assert_eq!(1, req.len());
             match req.first().unwrap() {
-                JoinSetRequest::DelayRequest {
-                    delay_id: _,
-                    expires_at,
-                } => {
-                    assert!(delay_request_count > 0);
-                    sim_clock.sleep_until(*expires_at);
-                    delay_request_count -= 1;
+                JoinSetRequest::DelayRequest { .. } => {
+                    unreachable!("unreachable")
                 }
                 JoinSetRequest::ChildExecutionRequest { child_execution_id } => {
                     assert!(child_execution_count > 0);
-                    let child_request = loop {
-                        if let Ok(res) = db_connection.get(*child_execution_id).await {
-                            break res;
-                        }
-                    };
+                    let child_request = db_connection.get(*child_execution_id).await.unwrap();
                     assert_eq!(Some((execution_id, join_set_id)), child_request.parent());
                     // execute
                     let child_exec_task = {
